@@ -1,274 +1,354 @@
-"use strict";
+import { getNetwork } from './network.js';
+import {
+    activityDashboard,
+    getStakingBalance,
+    stakingDashboard,
+} from './global.js';
+import { getEventEmitter } from './event_bus.js';
+import Multimap from 'multimap';
+import { wallet } from './wallet.js';
+import { COIN } from './chain_params.js';
 
-/** An Unspent Transaction Output, used as Inputs of future transactions */
-class UTXO {
+export class CTxOut {
     /**
-     * @param {Object} UTXO
-     * @param {String} UTXO.id - Transaction ID
-     * @param {String} UTXO.path - If applicable, the HD Path of the owning address
-     * @param {Number} UTXO.sats - Satoshi value in this UTXO
-     * @param {String} UTXO.script - HEX encoded spending script
-     * @param {Number} UTXO.vout - Output position of this transaction
-     * @param {Number} UTXO.height - Block height of the UTXO
-     * @param {Number} UTXO.status - UTXO status enum state
-     * @param {bool} UTXO.isDelegate - Whether the UTXO is a cold stake delegation
+     * @param {Object} CTxOut
+     * @param {COutpoint} CTxOut.outpoint - COutpoint of the CTxOut
+     * @param {String} CTxOut.script - Redeem script, in HEX
+     * @param {Number} CTxOut.value - Value in satoshi
      */
-    constructor({id, path, sats, script, vout, height, status, isDelegate = false, isReward = false} = {}) {
+    constructor({ outpoint, script, value } = {}) {
+        /** COutpoint of the CTxOut
+         *  @type {COutpoint} */
+        this.outpoint = outpoint;
+        /** Redeem script, in hex
+         * @type {String} */
+        this.script = script;
+        /** Value in satoshi
+         *  @type {Number} */
+        this.value = value;
+    }
+}
+export class CTxIn {
+    /**
+     * @param {Object} CTxIn
+     * @param {COutpoint} CTxIn.outpoint - Outpoint of the UTXO that the vin spends
+     * @param {String} CTxIn.scriptSig - Script used to spend the corresponding UTXO, in hex
+     */
+    constructor({ outpoint, scriptSig } = {}) {
+        /** Outpoint of the UTXO that the vin spends
+         *  @type {COutpoint} */
+        this.outpoint = outpoint;
+        /** Script used to spend the corresponding UTXO, in hex
+         * @type {String} */
+        this.scriptSig = scriptSig;
+    }
+}
+
+export class Transaction {
+    /**
+     * @param {Object} Transaction
+     * @param {String} Transaction.txid - Transaction ID
+     * @param {Number} Transaction.blockHeight - Block height of the transaction (-1 if is pending)
+     * @param {Array<CTxIn>} Transaction.vin - Inputs of the transaction
+     * @param {Array<CTxOut>} Transaction.vout - Outputs of the transaction
+     */
+    constructor({ txid, blockHeight, vin, vout } = {}) {
         /** Transaction ID
          * @type {String} */
-        this.id = id;
-
-        /** HD Path of the owning address
-         *  @type {String} */
-        this.path = path;
-
-        /** Satoshi value in this UTXO
-         *  @type {Number} */
-        this.sats = sats;
-
-        /** HEX encoded spending script
-         *  @type {String} */
-        this.script = script;
-
-        /** Output position of this transaction
-         *  @type {Number} */
+        this.txid = txid;
+        /** Block height of the transaction (-1 if is pending)
+         * @param {Number} */
+        this.blockHeight = blockHeight;
+        /** Inputs of the transaction
+         *  @type {Array<CTxIn>}*/
+        this.vin = vin;
+        /** Outputs of the transaction
+         *  @type {Array<CTxOut>}*/
         this.vout = vout;
-
-        /** Block height of the UTXO
-         *  @type {Number} */
-        this.height = height;
-
-        /** UTXO status enum state
-         *  @type {Number} */
-        this.status = status;
-
-        /** If it's a delegation UTXO
-        * @type {bool} */
-        this.isDelegate = isDelegate;
-
-	this.isReward = isReward;
     }
-
+    isConfirmed() {
+        return this.blockHeight != -1;
+    }
+}
+/** An Unspent Transaction Output, used as Inputs of future transactions */
+export class COutpoint {
     /**
-     * Check for equality between this UTXO and another UTXO
-     * @param {UTXO} cUTXO - UTXO to compare against
-     * @returns {Boolean} `true` if equal, `false` if unequal
+     * @param {Object} COutpoint
+     * @param {String} COutpoint.txid - Transaction ID
+     * @param {Number} COutpoint.n - Outpoint position in the corresponding transaction
      */
-    equalsUTXO(cUTXO) {
-        return this.id === cUTXO.id && this.vout === cUTXO.vout && this.status === cUTXO.status;
+    constructor({ txid, n } = {}) {
+        /** Transaction ID
+         * @type {String} */
+        this.txid = txid;
+        /** Outpoint position in the corresponding transaction
+         *  @type {Number} */
+        this.n = n;
     }
+}
+
+export const UTXO_WALLET_STATE = {
+    NOT_MINE: 0, // Don't have the key to spend this utxo
+    SPENDABLE: 1, // Have the key to spend this (P2PKH) utxo
+    SPENDABLE_COLD: 2, // Have the key to spend this (P2CS) utxo
+    COLD_RECEIVED: 4, // Have the staking key of this (P2CS) utxo
+    SPENDABLE_TOTAL: 1 | 2,
 };
 
 /** A Mempool instance, stores and handles UTXO data for the wallet */
-class Mempool {
+export class Mempool {
+    /**
+     * @type {boolean}
+     */
+    #isLoaded = false;
+    /**
+     * @type {number} - Our Public balance in Satoshis
+     */
+    #balance = 0;
+    /**
+     * @type {number} - Our Cold Staking balance in Satoshis
+     */
+    #coldBalance = 0;
+    /**
+     * @type {Number}
+     * The maximum block height that we received with the call 'utxos'
+     * We don't want to receive anymore transactions which are below this block
+     */
+    #syncHeight = -1;
     constructor() {
-        /** 
-         * An array of all known UTXOs
-         * @type {Array<UTXO>}
+        /**
+         * Multimap txid -> spent Coutpoint
+         * @type {Multimap<String, COutpoint>}
          */
-        this.UTXOs = [];
+        this.spent = new Multimap();
+        /**
+         * A map of all known transactions
+         * @type {Map<String, Transaction>}
+         */
+        this.txmap = new Map();
+        this.subscribeToNetwork();
     }
 
-    /** The CONFIRMED state (UTXO is spendable) */
-    static CONFIRMED = 0;
-
-    /** The REMOVED state (UTXO was spent and will be removed soon) */
-    static REMOVED = 1;
-
-    /** The PENDING state (standard UTXO is in mempool, pending confirmation) */
-    static PENDING = 2;
-
-    /**
-     * Remove a UTXO after a set amount of time
-     * @param {Number} nBlocks - Estimated blocks to wait
-     * @param {UTXO} cUTXO - UTXO to remove
-     */
-     async removeWithDelay(nBlocks, cUTXO) {
-        await sleep(nBlocks * 60 * 1000);
-        this.removeUTXO(cUTXO);
+    reset() {
+        this.#isLoaded = false;
+        this.txmap = new Map();
+        this.spent = new Multimap();
     }
-
-    /**
-     * Check if an exact UTXO match can be found in our wallet
-     * @param {Object} UTXO
-     * @param {String} UTXO.id - Transaction ID
-     * @param {Number} UTXO.vout - Output position of this transaction
-     * @param {Number} [UTXO.status] - UTXO status enum state. If it's undefined, it will ignore it.
-     * @returns {Boolean} `true` or `false`
-     */
-    isAlreadyStored({id, vout, status}) {
-	return this.UTXOs.some(
-	    cUTXO => (cUTXO.id === id && cUTXO.vout === vout && (!status || cUTXO.status === status)));
+    get balance() {
+        return this.#balance;
+    }
+    get coldBalance() {
+        return this.#coldBalance;
+    }
+    get isLoaded() {
+        return this.#isLoaded;
     }
 
     /**
-     * Fetches an array of UTXOs filtered by their state
-     * @param {Number} nState - Specific UTXO state
-     * @returns {Array<UTXO>} `array` - An array of UTXOs
+     * Subscribes to network events
+     * @param {Network} network
      */
-    getUTXOsByState(nState) {
-        return this.UTXOs.filter(cUTXO => cUTXO.status === nState);
-    }
-
-
-
-    /**
-     * Removes a UTXO from a specific state
-     * @param {UTXO} cNewUTXO - Pending UTXO to remove
-     * @param {Number} nState - Specific state of this UTXO to search for
-     */
-    removeFromState(cNewUTXO, nState) {
-        const arrPendingUTXOs = this.getUTXOsByState(nState);
-        // Loop each pending UTXO
-        for (const cUTXO of arrPendingUTXOs) {
-            // Search for matching ID + output number
-            if (cUTXO.id === cNewUTXO.id && cUTXO.vout === cNewUTXO.vout) {
-                // Nuke it from orbit
-                this.removeUTXO(cUTXO);
-                break;
-            }
-        }
-    }
-
-    /**
-     * Add a new UTXO to the wallet
-     * @param {Object} UTXO
-     * @param {String} UTXO.id - Transaction ID
-     * @param {String} UTXO.path - If applicable, the HD Path of the owning address
-     * @param {Number} UTXO.sats - Satoshi value in this UTXO
-     * @param {String} UTXO.script - HEX encoded spending script
-     * @param {Number} UTXO.vout - Output position of this transaction
-     * @param {Number} UTXO.height - Block height of the UTXO
-     * @param {Number} UTXO.status - UTXO status enum state
-     * @param {Boolean} UTXO.isDelegate - If this is a Cold Delegation
-     */
-    addUTXO({id, path, sats, script, vout, height, status, isDelegate}) {
-      const newUTXO = new UTXO({id, path, sats, script, vout, height, status, isDelegate});
-	
-	if (this.isAlreadyStored({ id, vout })) {
-	    this.updateUTXO({id, vout});
-	} else {
-            this.UTXOs.push(newUTXO);
-	}
-        getBalance(true);
-        getStakingBalance(true);
-    }
-
-    /**
-     * Update an existing UTXO, by confirming its pending status
-     * The UTXO must be in 
-     * @param {Object} UTXO - Object to be deconstructed
-     * @param {String} UTXO.id - Transaction id
-     * @param {Number} UTXO.vout - vout
-     */
-    updateUTXO({id, vout}) {
-	if(debug) {
-	    console.assert(this.isAlreadyStored({id, vout}), "updateUTXO must be called with an existing UTXO");
-	}
-	const cUTXO = this.UTXOs.find(utxo => utxo.id === id && utxo.vout == vout);
-	switch (cUTXO.status) {
-	case Mempool.PENDING:
-	    cUTXO.status = Mempool.CONFIRMED;
-	    break;
-	}
-	getBalance(true);
-	getStakingBalance(true);
-    }
-
-    /**
-     * Remove a UTXO completely from our wallet
-     * @param {UTXO} cUTXO - UTXO to remove
-     */
-    removeUTXO(cUTXO) {
-        this.UTXOs = this.UTXOs.filter(utxo => !utxo.equalsUTXO(cUTXO));
-    }
-    
-    /**
-     * Remove a UTXO completely from our wallet, with a 12 minute delay given his id, path and vout
-     * @param {Object} UTXO
-     * @param {String} UTXO.id - Transaction ID
-     * @param {Number} UTXO.vout - Output position of this transaction
-     */
-    autoRemoveUTXO({id, vout}) {
-        for (const cUTXO of this.UTXOs) {
-            // Loop given + internal UTXOs to find a match, then start the delayed removal
-            if (cUTXO.id === id && cUTXO.vout === vout) {
-                cUTXO.status = Mempool.REMOVED;
-                this.removeWithDelay(12, cUTXO);
+    subscribeToNetwork() {
+        getEventEmitter().on('utxo', async (utxos) => {
+            //Should not really happen
+            if (this.#isLoaded) {
+                console.error(
+                    'ERROR! Event UTXO called on already loaded mempool'
+                );
                 return;
             }
-        }
-        console.error("Mempool: Failed to find UTXO " + id + " (" + vout + ") for auto-removal!");
-    }
-    
-    /**
-     * Remove many UTXOs completely from our wallet, with a 12 minute delay
-     * @param {Array<UTXO>} arrUTXOs - UTXOs to remove
-     */
-    autoRemoveUTXOs(arrUTXOs) {
-        for (const cNewUTXO of arrUTXOs) {
-            for (const cUTXO of this.UTXOs) {
-                // Loop given + internal UTXOs to find a match, then start the delayed removal
-                if (cUTXO.equalsUTXO(cNewUTXO)) {
-                    cUTXO.status = Mempool.REMOVED;
-                    this.removeWithDelay(12, cUTXO);
-                    break;
+            getEventEmitter().emit('sync-status', 'start');
+            for (const utxo of utxos) {
+                this.#syncHeight = Math.max(this.#syncHeight, utxo.height);
+                if (this.txmap.has(utxo.txid)) {
+                    continue;
                 }
-            }    
+                // If the UTXO is new, we'll process it and add it internally
+                const tx = await getNetwork().getTxFullInfo(utxo.txid);
+                this.txmap.set(tx.txid, this.parseTransaction(tx));
+                //Little hack: sadly we don't have ALL the wallet txs
+                //So what we do: we put in spent state all the vouts that are not in the currrent utxos list.
+                for (const vout of tx.vout) {
+                    const op = new COutpoint({ txid: tx.txid, n: vout.n });
+                    const isMyUTXO = utxos.some(
+                        (x) => x.txid == op.txid && x.vout == op.n
+                    );
+                    if (!isMyUTXO && !this.isSpent(op)) {
+                        this.spent.set(tx.txid, op);
+                    }
+                }
+            }
+            this.#isLoaded = true;
+            this.#balance = this.getBalance(UTXO_WALLET_STATE.SPENDABLE);
+            this.#coldBalance = this.getBalance(
+                UTXO_WALLET_STATE.SPENDABLE_COLD
+            );
+            getEventEmitter().emit('balance-update');
+            getStakingBalance(true);
+            activityDashboard.update();
+            stakingDashboard.update();
+            getEventEmitter().emit('sync-status', 'stop');
+        });
+        getEventEmitter().on('recent_txs', async (txs) => {
+            // Don't process recent_txs if mempool is not loaded yet
+            if (!this.#isLoaded) {
+                return;
+            }
+            getEventEmitter().emit('sync-status', 'start');
+            for (const tx of txs) {
+                // Do not accept any tx which is below the syncHeight
+                if (this.#syncHeight >= tx.blockHeight) {
+                    continue;
+                }
+                if (
+                    !this.txmap.has(tx.txid) ||
+                    !this.txmap.get(tx.txid).isConfirmed()
+                ) {
+                    const fullTx = this.parseTransaction(
+                        await getNetwork().getTxFullInfo(tx.txid)
+                    );
+                    await this.updateMempool(fullTx);
+                }
+            }
+            getEventEmitter().emit('sync-status', 'stop');
+        });
+    }
+    /**
+     * An Outpoint to check
+     * @param {COutpoint} op
+     */
+    isSpent(op) {
+        return this.spent.get(op.txid)?.some((x) => x.n == op.n);
+    }
+
+    /**
+     * Get the total wallet balance
+     * @param {UTXO_WALLET_STATE} filter the filter you want to apply
+     */
+    getBalance(filter) {
+        let totBalance = 0;
+        for (const [_, tx] of this.txmap) {
+            for (const vout of tx.vout) {
+                if (this.isSpent(vout.outpoint)) {
+                    continue;
+                }
+                const UTXO_STATE = wallet.isMyVout(vout.script);
+                if ((UTXO_STATE & filter) == 0) {
+                    continue;
+                }
+                totBalance += vout.value;
+            }
         }
+        return totBalance;
+    }
+    /**
+     * Outpoint that we want to fetch
+     * @param {COutpoint} op
+     * @param {UTXO_WALLET_STATE} filter the filter you want to apply
+     * @param {Boolean} onlyConfirmed consider only confirmed transactions
+     */
+    hasUTXO(op, filter, onlyConfirmed) {
+        // If the outpoint is spent return false
+        if (this.isSpent(op)) {
+            return false;
+        }
+        // If we don't have the outpoint return false
+        if (!this.txmap.has(op.txid)) {
+            return false;
+        }
+        const tx = this.txmap.get(op.txid);
+        // Check if the tx is confirmed
+        if (onlyConfirmed && !tx.isConfirmed()) {
+            return false;
+        }
+        const vout = tx.vout[op.n];
+        const UTXO_STATE = wallet.isMyVout(vout.script);
+        // Check if the UTXO has the state we wanted
+        if ((UTXO_STATE & filter) == 0) {
+            return false;
+        }
+        return true;
     }
 
     /**
-     * Fetches an array of confirmed UTXOs, an easier alias to {@link getUTXOsByState}
-     * @returns {Array<UTXO>} `array` - An array of UTXOs
+     * Get a list of UTXOs
+     * @param {Object} o
+     * @param {Number} o.filter enum element of UTXO_WALLET_STATE
+     * @param {Number | null} o.target PIVs in satoshi that we want to spend
+     * @param {Boolean} o.onlyConfirmed Consider only confirmed transactions
+     * @returns {CTxOut[]} Array of fetched UTXOs
      */
-    getConfirmed() {
-        return this.getUTXOsByState(Mempool.CONFIRMED);
+    getUTXOs({ filter, target, onlyConfirmed = false }) {
+        let totFound = 0;
+        let utxos = [];
+        for (const [_, tx] of this.txmap) {
+            if (onlyConfirmed && !tx.isConfirmed()) {
+                continue;
+            }
+            for (const vout of tx.vout) {
+                if (this.isSpent(vout.outpoint)) {
+                    continue;
+                }
+                const UTXO_STATE = wallet.isMyVout(vout.script);
+                if ((UTXO_STATE & filter) == 0) {
+                    continue;
+                }
+                utxos.push(vout);
+                // Return early if you found enough PIVs (11/10 is to make sure to pay fee)
+                totFound += vout.value;
+                if (target && totFound > (11 / 10) * target) {
+                    return utxos;
+                }
+            }
+        }
+        return utxos;
     }
 
     /**
-     * Get standard, non delegated, UTXOs
-     * @returns {Array<UTXO>} Non delegated utxos
+     * @param {Object} tx - tx object fetched from the explorer
+     * @returns {Transaction} transaction parsed
      */
-    getStandardUTXOs() {
-        return this.UTXOs.filter(cUTXO => cUTXO.status !== Mempool.REMOVED && !cUTXO.isDelegate);
+    parseTransaction(tx) {
+        const vout = [];
+        const vin = [];
+        for (const out of tx.vout) {
+            vout.push(
+                new CTxOut({
+                    outpoint: new COutpoint({ txid: tx.txid, n: out.n }),
+                    script: out.scriptPubKey.hex,
+                    value: out.value * COIN,
+                })
+            );
+        }
+        for (const inp of tx.vin) {
+            const op = new COutpoint({ txid: inp.txid, n: inp.vout });
+            vin.push(new CTxIn({ outpoint: op, scriptSig: inp.scriptSig.hex }));
+        }
+        return new Transaction({
+            txid: tx.txid,
+            blockHeight:
+                getNetwork().cachedBlockCount -
+                (tx.confirmations - 1) -
+                tx.confirmations,
+            vin,
+            vout,
+        });
     }
-
     /**
-     * Get delegated UTXOs
-     * @returns {Array<UTXO>} Delegated UTXOs
+     * Update the mempool status
+     * @param {Transaction} tx
      */
-    getDelegatedUTXOs() {
-        return this.UTXOs.filter(cUTXO => cUTXO.status !== Mempool.REMOVED && cUTXO.isDelegate);
+    updateMempool(tx) {
+        this.txmap.set(tx.txid, tx);
+        for (const vin of tx.vin) {
+            const op = vin.outpoint;
+            if (!this.isSpent(op)) {
+                this.spent.set(op.txid, op);
+            }
+        }
+        this.#balance = this.getBalance(UTXO_WALLET_STATE.SPENDABLE);
+        this.#coldBalance = this.getBalance(UTXO_WALLET_STATE.SPENDABLE_COLD);
+        getEventEmitter().emit('balance-update');
+        getStakingBalance(true);
     }
-
-    /**
-     * Returns the real-time balance of the wallet (all addresses)
-     * @returns {Number} Balance in satoshis
-     */
-    getBalance() {
-        // Fetch 'standard' balances: the sum of all Confirmed or Unconfirmed transactions (excluding Masternode collaterals)
-        return this.getStandardUTXOs().filter(cUTXO => !isMasternodeUTXO(cUTXO)).reduce((a, b) => a + b.sats, 0);
-    }
-
-    /**
-     * Returns if a UTXO is valid
-     * @param {UTXO} cUTXO - UTXO
-     * @returns {Boolean} `true` if the reward UTXO is spendable, `false` if not
-     */
-    static isValidUTXO(cUTXO) {
-	if (cUTXO.isReward) {
-            return cachedBlockCount - cUTXO.height > 100;
-	} else {
-	    return true;
-	}
-    }
-
-    /**
-     * Returns the real-time delegated balance of the wallet (all addresses)
-     * @returns {Number} Delegated balance in satoshis
-     */
-    getDelegatedBalance() {
-        return this.getDelegatedUTXOs().reduce((a, b) => a + b.sats, 0);
-    }
-};
+}
